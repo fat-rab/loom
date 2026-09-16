@@ -1,4 +1,4 @@
-// Structured model calls share schema constraints and support opt-in strict JSON responses.
+// Structured model calls require complete JSON responses that satisfy the shared schema.
 package loom
 
 import (
@@ -28,14 +28,6 @@ type structuredChatConfig[T any] struct {
 	maxAttempts uint64
 	validate    func(T) error
 	callOptions []CallModelOption
-	strictJSON  bool
-}
-
-// WithStructuredStrictJSON requires the entire response to be one valid JSON
-// value. Markdown fences and surrounding prose trigger the normal output retry.
-// It does not require provider-native json_schema support.
-func WithStructuredStrictJSON[T any]() StructuredChatOption[T] {
-	return func(cfg *structuredChatConfig[T]) { cfg.strictJSON = true }
 }
 
 // WithStructuredName 设置传给 provider 的 response_format 名称。
@@ -78,7 +70,7 @@ func WithStructuredFailover[T any](cfg FailoverConfig) StructuredChatOption[T] {
 	return WithStructuredCallOptions[T](WithModelFailover(cfg))
 }
 
-// StructuredOutputError 表示模型返回了 JSON,但没有满足本地 schema 或业务校验。
+// StructuredOutputError 表示模型输出不完整、不是合法 JSON，或未通过本地 schema / 业务校验。
 type StructuredOutputError struct {
 	Attempt uint64
 	Content string
@@ -97,7 +89,8 @@ func (e *StructuredOutputError) Unwrap() error {
 //
 // Schema 从 T 及可映射的 validate 标签生成。Provider 原生支持 json_schema 时会传 schema;仅支持
 // json_object 时退化成 JSON object + prompt 约束;本地始终执行 parse + schema validate。
-// 不可映射的业务约束通过 WithStructuredValidator 校验；默认保留从文本中提取 JSON 的行为。
+// 响应必须整体为一个合法 JSON 值，不提取 Markdown 或解释中的 JSON。
+// 不可映射的业务约束通过 WithStructuredValidator 校验。
 func ChatStructured[T any](
 	ctx context.Context,
 	purpose string,
@@ -158,10 +151,6 @@ func ChatStructured[T any](
 				Content: resp.Content,
 				Err:     fmt.Errorf("finish_reason=%s", resp.FinishReason),
 			}
-			continue
-		}
-		if cfg.strictJSON && !jsontext.Value(strings.TrimSpace(resp.Content)).IsValid() {
-			lastErr = &StructuredOutputError{Attempt: attempt, Content: resp.Content, Err: errors.New("expected one strict JSON value")}
 			continue
 		}
 		value, err := parseStructuredResponse[T](resp.Content, resolved, cfg.validate)
@@ -301,10 +290,8 @@ func withStructuredRetryMessages(messages []Message, resp *ChatResponse, err err
 
 func parseStructuredResponse[T any](content string, schema *jsonschema.Resolved, validate func(T) error) (T, error) {
 	var zero T
-	raw, err := extractJSONValue(content)
-	if err != nil {
-		return zero, err
-	}
+	// Validate the whole response against the same schema regardless of provider capabilities.
+	raw := []byte(content)
 	var instance any
 	if err := jsonv2.Unmarshal(raw, &instance); err != nil {
 		return zero, fmt.Errorf("解析 JSON: %w", err)
@@ -322,39 +309,6 @@ func parseStructuredResponse[T any](content string, schema *jsonschema.Resolved,
 		}
 	}
 	return out, nil
-}
-
-func extractJSONValue(content string) ([]byte, error) {
-	content = strings.TrimSpace(content)
-	content = strings.TrimPrefix(content, "```json")
-	content = strings.TrimPrefix(content, "```")
-	content = strings.TrimSuffix(content, "```")
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return nil, errors.New("输出为空")
-	}
-	if jsontext.Value(content).IsValid() {
-		return []byte(content), nil
-	}
-	startObj := strings.Index(content, "{")
-	startArr := strings.Index(content, "[")
-	start := -1
-	end := -1
-	if startObj >= 0 && (startArr < 0 || startObj < startArr) {
-		start = startObj
-		end = strings.LastIndex(content, "}")
-	} else if startArr >= 0 {
-		start = startArr
-		end = strings.LastIndex(content, "]")
-	}
-	if start < 0 || end <= start {
-		return nil, errors.New("未找到 JSON 值")
-	}
-	raw := strings.TrimSpace(content[start : end+1])
-	if !jsontext.Value(raw).IsValid() {
-		return nil, errors.New("提取到的 JSON 无效")
-	}
-	return []byte(raw), nil
 }
 
 func defaultStructuredOutputName[T any]() string {

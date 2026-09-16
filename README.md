@@ -131,20 +131,19 @@ schema through native `json_schema` or a `json_object` prompt and validates the
 response locally. Use `WithStructuredValidator` for additional business rules
 or constraints that cannot be represented in JSON Schema.
 
-By default, responses may contain Markdown fences or surrounding prose. To
-require the entire response to be one valid JSON value, enable strict parsing:
+Every response must be one complete JSON value and pass local schema validation,
+regardless of whether the model supports `json_schema`, `json_object`, or only
+text output. Markdown fences, surrounding prose, and multiple JSON values are
+rejected; JSON whitespace is accepted. No strict-mode option is required:
 
 ```go
 type Result struct {
     Summary string `json:"summary" validate:"min=1,max=200"`
 }
 
-result, response, err := loom.ChatStructured[Result](ctx, "summary", model, request,
-    loom.WithStructuredStrictJSON[Result](),
-)
+result, response, err := loom.ChatStructured[Result](ctx, "summary", model, request)
 ```
 
-Strict parsing accepts JSON whitespace and works with `json_object` models.
 Invalid JSON or schema violations use the configured output retry limit
 (`WithStructuredMaxAttempts`, two attempts by default).
 
