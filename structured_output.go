@@ -1,3 +1,4 @@
+// Structured model calls share schema constraints and support opt-in strict JSON responses.
 package loom
 
 import (
@@ -27,6 +28,14 @@ type structuredChatConfig[T any] struct {
 	maxAttempts uint64
 	validate    func(T) error
 	callOptions []CallModelOption
+	strictJSON  bool
+}
+
+// WithStructuredStrictJSON requires the entire response to be one valid JSON
+// value. Markdown fences and surrounding prose trigger the normal output retry.
+// It does not require provider-native json_schema support.
+func WithStructuredStrictJSON[T any]() StructuredChatOption[T] {
+	return func(cfg *structuredChatConfig[T]) { cfg.strictJSON = true }
 }
 
 // WithStructuredName 设置传给 provider 的 response_format 名称。
@@ -86,8 +95,9 @@ func (e *StructuredOutputError) Unwrap() error {
 
 // ChatStructured 调用模型并把输出解析为 T。
 //
-// Schema 从 T 自动生成。Provider 原生支持 json_schema 时会传 schema;仅支持
+// Schema 从 T 及可映射的 validate 标签生成。Provider 原生支持 json_schema 时会传 schema;仅支持
 // json_object 时退化成 JSON object + prompt 约束;本地始终执行 parse + schema validate。
+// 不可映射的业务约束通过 WithStructuredValidator 校验；默认保留从文本中提取 JSON 的行为。
 func ChatStructured[T any](
 	ctx context.Context,
 	purpose string,
@@ -117,7 +127,7 @@ func ChatStructured[T any](
 		cfg.description = "structured response"
 	}
 
-	schema, err := jsonschema.For[T](nil)
+	schema, err := SchemaFor[T]()
 	if err != nil {
 		return zero, nil, fmt.Errorf("loom.ChatStructured: 生成 JSON schema: %w", err)
 	}
@@ -148,6 +158,10 @@ func ChatStructured[T any](
 				Content: resp.Content,
 				Err:     fmt.Errorf("finish_reason=%s", resp.FinishReason),
 			}
+			continue
+		}
+		if cfg.strictJSON && !jsontext.Value(strings.TrimSpace(resp.Content)).IsValid() {
+			lastErr = &StructuredOutputError{Attempt: attempt, Content: resp.Content, Err: errors.New("expected one strict JSON value")}
 			continue
 		}
 		value, err := parseStructuredResponse[T](resp.Content, resolved, cfg.validate)

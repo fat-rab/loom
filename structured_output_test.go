@@ -1,3 +1,4 @@
+// Verify structured response validation, retry, provider fallback, and JSON parsing modes.
 package loom
 
 import (
@@ -135,6 +136,8 @@ func TestChatStructured_FailoverRebuildsRequestForFallbackCapabilities(t *testin
 		"test.structured_failover",
 		primary,
 		ChatRequest{Messages: []Message{{Role: RoleUser, Content: "review"}}},
+		WithStructuredStrictJSON[structuredReviewFixture](),
+		WithStructuredCallOptions[structuredReviewFixture](WithCallModelCaptureContent(false)),
 		WithStructuredFailover[structuredReviewFixture](FailoverConfig{
 			ShouldFailover: ShouldFailoverOnErrorOrFinishReason(FinishReasonContentFilter),
 			GetFailoverModel: func(context.Context, FailoverAttempt) (ChatModel, error) {
@@ -169,5 +172,91 @@ func TestNormalizeStructuredOutputName(t *testing.T) {
 	got := NormalizeStructuredOutputName("  review result / 中文  ")
 	if got != "review_result" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestChatStructuredProjectsValidationTags(t *testing.T) {
+	type output struct {
+		Notes string `json:"notes" validate:"min=1,max=3"`
+	}
+	for _, mode := range []StructuredOutputMode{StructuredOutputJSONSchema, StructuredOutputJSONObject} {
+		t.Run(string(mode), func(t *testing.T) {
+			model := &fakeStructuredModel{
+				capabilities: ModelCapabilities{StructuredOutput: mode},
+				responses:    []string{`{"notes":"too long"}`, `{"notes":"ok"}`},
+			}
+			// Tag constraints apply independently of the opt-in strict parsing option.
+			got, _, err := ChatStructured[output](t.Context(), "test.tags", model, ChatRequest{})
+			if err != nil || got.Notes != "ok" || len(model.requests) != 2 {
+				t.Fatalf("tag validation: got=%+v err=%v calls=%d", got, err, len(model.requests))
+			}
+			req := model.requests[0]
+			if req.StructuredOutput == nil || req.StructuredOutput.Mode != mode {
+				t.Fatalf("unexpected provider mode: %+v", req.StructuredOutput)
+			}
+			if mode == StructuredOutputJSONSchema {
+				notes := req.StructuredOutput.Schema.Properties["notes"]
+				if notes.MinLength == nil || *notes.MinLength != 1 || notes.MaxLength == nil || *notes.MaxLength != 3 {
+					t.Fatalf("provider schema lost validate constraints: %+v", notes)
+				}
+			} else if len(req.Messages) != 1 || !strings.Contains(req.Messages[0].Content, `"maxLength": 3`) {
+				t.Fatalf("JSON object prompt lost schema constraints: %+v", req.Messages)
+			}
+		})
+	}
+}
+
+func TestChatStructuredStrictJSONRetries(t *testing.T) {
+	type output struct {
+		Notes string `json:"notes"`
+	}
+	for _, mode := range []StructuredOutputMode{StructuredOutputJSONSchema, StructuredOutputJSONObject, StructuredOutputNone} {
+		for _, tc := range []struct{ name, response string }{
+			{"fenced", "```json\n{\"notes\":\"bad\"}\n```"},
+			{"leading prose", `Here is the result: {"notes":"bad"}`},
+			{"trailing prose", `{"notes":"bad"} End of result.`},
+			{"multiple values", `{"notes":"bad"} {"notes":"bad"}`},
+			{"truncated", `{"notes":`},
+			{"empty", " "},
+			{"wrong type", `{"notes":true}`},
+			{"missing field", `{}`},
+			{"extra field", `{"notes":"bad","extra":true}`},
+		} {
+			t.Run(string(mode)+"/"+tc.name, func(t *testing.T) {
+				model := &fakeStructuredModel{capabilities: ModelCapabilities{StructuredOutput: mode},
+					responses: []string{tc.response, " \n{\"notes\":\"ok\"}\t "}}
+				got, _, err := ChatStructured[output](t.Context(), "test.strict", model, ChatRequest{}, WithStructuredStrictJSON[output]())
+				if err != nil || got.Notes != "ok" || len(model.requests) != 2 {
+					t.Fatalf("strict retry: got=%+v err=%v calls=%d", got, err, len(model.requests))
+				}
+				if len(model.requests[1].Messages) <= len(model.requests[0].Messages) {
+					t.Fatal("retry must include feedback to correct the invalid response")
+				}
+			})
+		}
+	}
+}
+
+func TestChatStructuredStrictJSONRespectsAttemptLimit(t *testing.T) {
+	content := "```json\n{\"overall_done\":true,\"notes\":\"ok\"}\n```"
+	model := &fakeStructuredModel{capabilities: ModelCapabilities{StructuredOutput: StructuredOutputJSONObject}, responses: []string{content}}
+	_, response, err := ChatStructured[structuredReviewFixture](t.Context(), "test.strict_limit", model, ChatRequest{},
+		WithStructuredStrictJSON[structuredReviewFixture](), WithStructuredMaxAttempts[structuredReviewFixture](1))
+	var outputErr *StructuredOutputError
+	if !errors.As(err, &outputErr) || outputErr.Attempt != 1 || outputErr.Content != content || response == nil || response.Content != content || len(model.requests) != 1 {
+		t.Fatalf("expected final invalid response and structured error: response=%+v err=%v calls=%d", response, err, len(model.requests))
+	}
+}
+
+func TestChatStructuredDefaultStillExtractsJSON(t *testing.T) {
+	for _, content := range []string{
+		"```json\n{\"overall_done\":true,\"notes\":\"ok\"}\n```",
+		`Result: {"overall_done":true,"notes":"ok"} Done.`,
+	} {
+		model := &fakeStructuredModel{capabilities: ModelCapabilities{StructuredOutput: StructuredOutputJSONObject}, responses: []string{content}}
+		got, _, err := ChatStructured[structuredReviewFixture](t.Context(), "test.default", model, ChatRequest{})
+		if err != nil || !got.OverallDone || got.Notes != "ok" || len(model.requests) != 1 {
+			t.Fatalf("default extraction changed: got=%+v err=%v", got, err)
+		}
 	}
 }
